@@ -7,19 +7,16 @@ import {
   downloadMediaMessage
 } from "@whiskeysockets/baileys";
 import pino from "pino";
-import fs from "fs";
 import path from "path";
+import yts from "yt-search";
 import { formatCommandCatalog, TOTAL_COMMANDS } from "./commands.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const PREFIX = ".";
 
-// Hosted logo URL (hot-pink TEEBOT 01 robot)
+// Hot-pink TEEBOT 01 logo from your web app
 const BOT_LOGO_URL = process.env.BOT_LOGO_URL || "https://teebot2.lovable.app/icons/icon-512.png";
-
-let activeSocket = null;
-let activeAuthState = null;
 
 app.get("/", (req, res) => {
   res.json({
@@ -46,7 +43,6 @@ app.get(["/code", "/pair"], async (req, res) => {
 
   try {
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    activeAuthState = { state, saveCreds, sessionDir };
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -57,10 +53,9 @@ app.get(["/code", "/pair"], async (req, res) => {
       browser: ["Ubuntu", "Chrome", "20.0.04"]
     });
 
-    activeSocket = sock;
     sock.ev.on("creds.update", saveCreds);
 
-    // Setup listener for incoming commands (.vv, .menu, etc.)
+    // Setup listener for incoming commands (.play, .vv, .menu, etc.)
     setupMessageHandlers(sock);
 
     // Setup connection state listener
@@ -70,9 +65,9 @@ app.get(["/code", "/pair"], async (req, res) => {
       if (connection === "close") {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`Connection closed (code ${statusCode}), reconnect: ${shouldReconnect}`);
+        console.log(`Connection closed (${statusCode}), reconnecting: ${shouldReconnect}`);
       } else if (connection === "open") {
-        console.log(`✅ TEEBOT 01 successfully linked to ${cleanNumber}!`);
+        console.log(`✅ TEEBOT 01 linked to ${cleanNumber}!`);
 
         // Send Welcome Message + Commands to linked user
         try {
@@ -85,26 +80,24 @@ app.get(["/code", "/pair"], async (req, res) => {
               `╔══════════════════════╗\n` +
               `   🤖 *WELCOME TO TEEBOT 01* 🤖\n` +
               `╚══════════════════════╝\n\n` +
-              `✨ Your WhatsApp has been successfully paired!\n` +
+              `✨ WhatsApp successfully linked!\n` +
               `⚡ *${TOTAL_COMMANDS}+ active commands* loaded.\n` +
-              `🔓 Anti-View-Once enabled! (Reply to any view-once with *.vv*)\n\n` +
-              `Type *${PREFIX}menu* to view all commands anytime.\n\n` +
-              `_Sending full command list below..._`
+              `🎵 Music Player active (*.play <song name>*)\n` +
+              `🔓 Anti-View-Once active (*.vv*)\n\n` +
+              `Type *${PREFIX}menu* to see all commands anytime.`
           });
 
           // 2. Send Full Command Catalog text
           await sock.sendMessage(userJid, {
             text: formatCommandCatalog(PREFIX)
           });
-
-          console.log(`Sent welcome banner and catalog to ${userJid}`);
         } catch (err) {
           console.error("Failed to send welcome message:", err);
         }
       }
     });
 
-    // Wait a brief moment for socket initialization, then request pairing code
+    // Wait 2 seconds for socket initialization, then request pairing code
     await new Promise((resolve) => setTimeout(resolve, 2000));
     const code = await sock.requestPairingCode(cleanNumber);
 
@@ -123,7 +116,7 @@ app.get(["/code", "/pair"], async (req, res) => {
   }
 });
 
-// Command dispatcher: executes .vv, .menu, .ping, etc.
+// Command dispatcher
 function setupMessageHandlers(sock) {
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
@@ -140,29 +133,100 @@ function setupMessageHandlers(sock) {
         "";
 
       const trimmed = text.trim();
-      const command = trimmed.split(/\s+/)[0].toLowerCase();
+      const parts = trimmed.split(/\s+/);
+      const command = parts[0].toLowerCase();
+      const query = parts.slice(1).join(" ");
 
       // ==========================================
-      // 1. REVEAL / ANTI-VIEW-ONCE COMMAND (.vv)
+      // 1. MUSIC PLAYER WITH THUMBNAIL (.play / .song / .mp3)
       // ==========================================
-      if ([".vv", "!vv", ".rvo", ".reveal", ".antiviewonce"].includes(command)) {
+      if ([".play", "!play", ".song", "!song", ".mp3"].includes(command)) {
+        if (!query) {
+          await sock.sendMessage(chatId, {
+            text: "🎵 *Please enter a song name!*\n\n*Example:* `.play Burna Boy City Boys`"
+          }, { quoted: msg });
+          continue;
+        }
+
         try {
-          const quotedContext = msg.message?.extendedTextMessage?.contextInfo;
-          const quotedMsg = quotedContext?.quotedMessage;
+          // 1. Search YouTube for the song
+          const search = await yts(query);
+          const video = search.videos[0];
 
-          if (!quotedMsg) {
+          if (!video) {
             await sock.sendMessage(chatId, {
-              text: "❌ *Reply to a view-once photo, video, or voice note with .vv to reveal it.*"
+              text: `❌ *No song found for:* "${query}"`
             }, { quoted: msg });
             continue;
           }
 
-          // Unwrap Baileys view-once wrappers
+          // 2. Send the Thumbnail Preview Card first
+          await sock.sendMessage(chatId, {
+            image: { url: video.thumbnail },
+            caption:
+              `🎶 *TEEBOT 01 MUSIC PLAYER* 🎶\n\n` +
+              `📌 *Title:* ${video.title}\n` +
+              `👤 *Artist:* ${video.author.name}\n` +
+              `⏱️ *Duration:* ${video.timestamp}\n` +
+              `👁️ *Views:* ${video.views.toLocaleString()}\n\n` +
+              `⏳ *Sending audio file now...*`
+          }, { quoted: msg });
+
+          // 3. Download MP3 stream from free audio endpoint
+          const dlApi = `https://api.siputzx.my.id/api/d/ytmp3?url=${encodeURIComponent(video.url)}`;
+          const dlRes = await fetch(dlApi);
+          const dlJson = await dlRes.json();
+          const audioUrl = dlJson.data?.dl || dlJson.result?.download || dlJson.download;
+
+          if (audioUrl) {
+            // 4. Send audio with thumbnail preview in WhatsApp audio bubble
+            await sock.sendMessage(chatId, {
+              audio: { url: audioUrl },
+              mimetype: "audio/mp4",
+              fileName: `${video.title}.mp3`,
+              contextInfo: {
+                externalAdReply: {
+                  title: video.title,
+                  body: `${video.author.name} • ${video.timestamp}`,
+                  thumbnailUrl: video.thumbnail,
+                  mediaType: 2,
+                  mediaUrl: video.url,
+                  sourceUrl: video.url,
+                  renderLargerThumbnail: true
+                }
+              }
+            }, { quoted: msg });
+          } else {
+            await sock.sendMessage(chatId, {
+              text: `⚠️ *Audio server busy.* Stream directly here:\n🔗 ${video.url}`
+            }, { quoted: msg });
+          }
+        } catch (err) {
+          console.error("Music command error:", err);
+          await sock.sendMessage(chatId, {
+            text: "❌ *Could not download music. Please try again.*"
+          }, { quoted: msg });
+        }
+      }
+
+      // ==========================================
+      // 2. REVEAL VIEW-ONCE (.vv / .rvo / .reveal)
+      // ==========================================
+      if ([".vv", "!vv", ".rvo", ".reveal", ".antiviewonce"].includes(command)) {
+        try {
+          const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+          if (!quoted) {
+            await sock.sendMessage(chatId, {
+              text: "❌ *Reply to a view-once photo, video, or voice note with .vv*"
+            }, { quoted: msg });
+            continue;
+          }
+
           const actualMsg =
-            quotedMsg.viewOnceMessageV2?.message ||
-            quotedMsg.viewOnceMessage?.message ||
-            quotedMsg.viewOnceMessageV2Extension?.message ||
-            quotedMsg;
+            quoted.viewOnceMessageV2?.message ||
+            quoted.viewOnceMessage?.message ||
+            quoted.viewOnceMessageV2Extension?.message ||
+            quoted;
 
           const isImage = !!actualMsg.imageMessage;
           const isVideo = !!actualMsg.videoMessage;
@@ -175,7 +239,6 @@ function setupMessageHandlers(sock) {
             continue;
           }
 
-          // Download media buffer
           const buffer = await downloadMediaMessage(
             { message: actualMsg },
             "buffer",
@@ -201,21 +264,21 @@ function setupMessageHandlers(sock) {
             await sock.sendMessage(chatId, {
               audio: buffer,
               mimetype: actualMsg.audioMessage.mimetype || "audio/mp4",
-              ptt: true // resend as playable voice note
+              ptt: true
             }, { quoted: msg });
           }
         } catch (err) {
-          console.error("Failed to reveal view-once:", err);
+          console.error("Reveal error:", err);
           await sock.sendMessage(chatId, {
-            text: "❌ *Failed to reveal media. The message might have expired or been purged.*"
+            text: "❌ *Failed to reveal media.*"
           }, { quoted: msg });
         }
       }
 
       // ==========================================
-      // 2. FULL MENU COMMAND (.menu / .help)
+      // 3. FULL MENU (.menu / .help)
       // ==========================================
-      if ([".menu", "!menu", ".help", "!help", ".list"].includes(command)) {
+      if ([".menu", "!menu", ".help", "!help"].includes(command)) {
         await sock.sendMessage(chatId, {
           image: { url: BOT_LOGO_URL },
           caption: formatCommandCatalog(PREFIX)
@@ -223,11 +286,11 @@ function setupMessageHandlers(sock) {
       }
 
       // ==========================================
-      // 3. PING / STATUS COMMAND (.ping / .alive)
+      // 4. PING (.ping / .alive)
       // ==========================================
       if ([".ping", "!ping", ".alive"].includes(command)) {
         await sock.sendMessage(chatId, {
-          text: `⚡ *Pong! TEEBOT 01 is active & online.*\n🤖 Loaded Commands: ${TOTAL_COMMANDS}\n⏱️ Uptime: ${Math.floor(process.uptime())}s`
+          text: `⚡ *TEEBOT 01 is Online*\n🤖 Total Commands: ${TOTAL_COMMANDS}\n⏱️ Uptime: ${Math.floor(process.uptime())}s`
         }, { quoted: msg });
       }
     }
@@ -235,7 +298,6 @@ function setupMessageHandlers(sock) {
 }
 
 app.listen(PORT, () => {
-  console.log(`TEEBOT 01 server listening on port ${PORT}`);
-  console.log(`Total commands registered: ${TOTAL_COMMANDS}`);
+  console.log(`TEEBOT 01 listening on port ${PORT}`);
 });
-            
+        
