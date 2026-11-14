@@ -5,6 +5,7 @@ import {
   fetchLatestWaWebVersion,
   fetchLatestBaileysVersion,
   DisconnectReason,
+  downloadContentFromMessage,
   downloadMediaMessage
 } from "@whiskeysockets/baileys";
 import pino from "pino";
@@ -22,6 +23,17 @@ const BOT_LOGO_URL = process.env.BOT_LOGO_URL || "https://teebot2.lovable.app/ic
 
 // Store active sockets in memory: phoneNumber -> sock
 const activeSockets = new Map();
+
+// In-memory cache for incoming view-once media so .reveal works even if already opened on phone
+const viewOnceCache = new Map();
+
+async function bufferFromStream(stream) {
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
 
 app.get("/", (req, res) => {
   res.json({
@@ -110,7 +122,7 @@ async function startSession(cleanNumber, res = null) {
             `✨ WhatsApp successfully linked!\n` +
             `⚡ *${TOTAL_COMMANDS}+ active commands* loaded.\n` +
             `🎵 Music Player (*${PREFIX}play <song name>*)\n` +
-            `🔓 Anti-View-Once (*${PREFIX}vv*)\n` +
+            `🔓 Anti-View-Once (*${PREFIX}reveal* / *${PREFIX}vv*)\n` +
             `🤖 AI Assistant (*${PREFIX}ai <question>*)\n\n` +
             `Type *${PREFIX}menu* to view all commands.`
         });
@@ -185,6 +197,34 @@ function setupMessageHandlers(sock) {
       const chatId = msg.key.remoteJid;
       if (!chatId) continue;
 
+      // 0. Auto-cache any view-once messages the split second they arrive
+      const rawViewOnce =
+        msg.message.viewOnceMessageV2?.message ||
+        msg.message.viewOnceMessage?.message ||
+        msg.message.viewOnceMessageV2Extension?.message;
+
+      if (rawViewOnce && msg.key?.id) {
+        const vType = ["imageMessage", "videoMessage", "audioMessage"].find((k) => rawViewOnce[k]);
+        if (vType) {
+          downloadContentFromMessage(rawViewOnce[vType], vType.replace("Message", ""))
+            .then(bufferFromStream)
+            .then((buf) => {
+              viewOnceCache.set(msg.key.id, {
+                buffer: buf,
+                type: vType,
+                caption: rawViewOnce[vType].caption,
+                mimetype: rawViewOnce[vType].mimetype
+              });
+              if (viewOnceCache.size > 50) {
+                const oldest = viewOnceCache.keys().next().value;
+                viewOnceCache.delete(oldest);
+              }
+            })
+            .catch(() => {});
+        }
+      }
+
+      // Extract message content
       const msgContent =
         msg.message.ephemeralMessage?.message ||
         msg.message.viewOnceMessage?.message ||
@@ -236,14 +276,42 @@ function setupMessageHandlers(sock) {
       // 3. REVEAL VIEW-ONCE (.vv / .rvo / .reveal)
       if ([`${PREFIX}vv`, `${PREFIX}rvo`, `${PREFIX}reveal`, `${PREFIX}antiviewonce`].includes(command)) {
         try {
-          const quoted = msgContent.extendedTextMessage?.contextInfo?.quotedMessage;
+          const quotedContext = msgContent.extendedTextMessage?.contextInfo;
+          const quoted = quotedContext?.quotedMessage;
+
           if (!quoted) {
             await sock.sendMessage(chatId, {
-              text: `❌ *Reply to a view-once photo, video, or voice note with ${PREFIX}vv*`
+              text: `⚠️ *Please reply to a view-once photo, video, or voice note with ${PREFIX}reveal*`
             }, { quoted: msg });
             continue;
           }
 
+          const quotedStanzaId = quotedContext.stanzaId;
+
+          // Check in-memory cache first (instant & works even if viewed on phone)
+          if (quotedStanzaId && viewOnceCache.has(quotedStanzaId)) {
+            const cached = viewOnceCache.get(quotedStanzaId);
+            if (cached.type === "imageMessage") {
+              await sock.sendMessage(chatId, {
+                image: cached.buffer,
+                caption: cached.caption ? `🔓 *Revealed:* ${cached.caption}` : "🔓 *Revealed View-Once Photo*"
+              }, { quoted: msg });
+            } else if (cached.type === "videoMessage") {
+              await sock.sendMessage(chatId, {
+                video: cached.buffer,
+                caption: cached.caption ? `🔓 *Revealed:* ${cached.caption}` : "🔓 *Revealed View-Once Video*"
+              }, { quoted: msg });
+            } else if (cached.type === "audioMessage") {
+              await sock.sendMessage(chatId, {
+                audio: cached.buffer,
+                mimetype: cached.mimetype || "audio/mp4",
+                ptt: true
+              }, { quoted: msg });
+            }
+            continue;
+          }
+
+          // Fallback: unwrap and download directly
           const actualMsg =
             quoted.viewOnceMessageV2?.message ||
             quoted.viewOnceMessage?.message ||
@@ -251,49 +319,65 @@ function setupMessageHandlers(sock) {
             quoted.ephemeralMessage?.message ||
             quoted;
 
-          const isImage = !!actualMsg.imageMessage;
-          const isVideo = !!actualMsg.videoMessage;
-          const isAudio = !!actualMsg.audioMessage;
+          const mediaType = ["imageMessage", "videoMessage", "audioMessage"].find((k) => actualMsg?.[k]);
 
-          if (!isImage && !isVideo && !isAudio) {
+          if (!mediaType) {
             await sock.sendMessage(chatId, {
-              text: "⚠️ *The quoted message is not view-once media.*"
+              text: "⚠️ *The quoted message is not a view-once image, video, or audio.*"
             }, { quoted: msg });
             continue;
           }
 
-          const buffer = await downloadMediaMessage(
-            { message: actualMsg },
-            "buffer",
-            {},
-            { logger: pino({ level: "silent" }) }
-          );
+          const mediaObj = actualMsg[mediaType];
+          const type = mediaType.replace("Message", "");
 
-          if (isImage) {
+          let buffer;
+          try {
+            const stream = await downloadContentFromMessage(mediaObj, type);
+            buffer = await bufferFromStream(stream);
+          } catch (e1) {
+            buffer = await downloadMediaMessage(
+              {
+                key: {
+                  remoteJid: chatId,
+                  id: quotedStanzaId
+                },
+                message: actualMsg
+              },
+              "buffer",
+              {},
+              {
+                logger: pino({ level: "silent" }),
+                reuploadRequest: sock.updateMediaMessage
+              }
+            );
+          }
+
+          if (!buffer || buffer.length === 0) {
+            throw new Error("No media bytes could be downloaded");
+          }
+
+          if (mediaType === "imageMessage") {
             await sock.sendMessage(chatId, {
               image: buffer,
-              caption: actualMsg.imageMessage?.caption
-                ? `🔓 *Revealed:* ${actualMsg.imageMessage.caption}`
-                : "🔓 *Revealed View-Once Photo*"
+              caption: mediaObj.caption ? `🔓 *Revealed:* ${mediaObj.caption}` : "🔓 *Revealed View-Once Photo*"
             }, { quoted: msg });
-          } else if (isVideo) {
+          } else if (mediaType === "videoMessage") {
             await sock.sendMessage(chatId, {
               video: buffer,
-              caption: actualMsg.videoMessage?.caption
-                ? `🔓 *Revealed:* ${actualMsg.videoMessage.caption}`
-                : "🔓 *Revealed View-Once Video*"
+              caption: mediaObj.caption ? `🔓 *Revealed:* ${mediaObj.caption}` : "🔓 *Revealed View-Once Video*"
             }, { quoted: msg });
-          } else if (isAudio) {
+          } else if (mediaType === "audioMessage") {
             await sock.sendMessage(chatId, {
               audio: buffer,
-              mimetype: actualMsg.audioMessage?.mimetype || "audio/mp4",
+              mimetype: mediaObj.mimetype || "audio/mp4",
               ptt: true
             }, { quoted: msg });
           }
         } catch (err) {
           console.error("Reveal error:", err);
           await sock.sendMessage(chatId, {
-            text: "❌ *Failed to reveal view-once media.*"
+            text: `❌ *Could not reveal:* WhatsApp expired the download token because it was already opened on your phone. To reveal, send/receive the view-once and reply *${PREFIX}reveal* immediately!`
           }, { quoted: msg });
         }
         continue;
@@ -451,4 +535,4 @@ function setupMessageHandlers(sock) {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`TEEBOT 01 listening on port ${PORT}`);
 });
-            
+          
