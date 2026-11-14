@@ -2,6 +2,7 @@ import express from "express";
 import {
   makeWASocket,
   useMultiFileAuthState,
+  fetchLatestWaWebVersion,
   fetchLatestBaileysVersion,
   DisconnectReason,
   downloadMediaMessage
@@ -19,7 +20,7 @@ const PREFIX = ".";
 // Hot-pink TEEBOT 01 logo from your web app
 const BOT_LOGO_URL = process.env.BOT_LOGO_URL || "https://teebot2.lovable.app/icons/icon-512.png";
 
-// Store active sockets in memory
+// Store active sockets in memory: phoneNumber -> sock
 const activeSockets = new Map();
 
 app.get("/", (req, res) => {
@@ -30,6 +31,158 @@ app.get("/", (req, res) => {
     time: new Date().toISOString()
   });
 });
+
+/**
+ * Initializes and manages a Baileys WhatsApp socket for a specific phone number.
+ * If res is passed, it generates and responds with the 8-character pairing code.
+ */
+async function startSession(cleanNumber, res = null) {
+  const sessionDir = path.join("/tmp", `teebot_auth_${cleanNumber}`);
+
+  // If a socket is already active for this number, close it cleanly
+  if (activeSockets.has(cleanNumber)) {
+    try {
+      const oldSock = activeSockets.get(cleanNumber);
+      oldSock.ev.removeAllListeners("connection.update");
+      oldSock.end(undefined);
+    } catch (_) {}
+    activeSockets.delete(cleanNumber);
+  }
+
+  // If new pairing request (res present), clear any unfinished auth files
+  if (res && fs.existsSync(sessionDir)) {
+    try {
+      const credsPath = path.join(sessionDir, "creds.json");
+      const isLinked = fs.existsSync(credsPath) && JSON.parse(fs.readFileSync(credsPath, "utf-8"))?.registered;
+      if (!isLinked) {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+      }
+    } catch (_) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+  }
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+
+  // Fetch the real, live WhatsApp Web protocol version
+  let version = [2, 3000, 1042466098];
+  try {
+    const waVer = await fetchLatestWaWebVersion({});
+    if (waVer?.version) version = waVer.version;
+  } catch (_) {
+    try {
+      const bVer = await fetchLatestBaileysVersion();
+      if (bVer?.version) version = bVer.version;
+    } catch (_) {}
+  }
+
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    logger: pino({ level: "silent" }),
+    printQRInTerminal: false,
+    // Real Chrome browser signature recognized by WhatsApp companion registration
+    browser: ["Ubuntu", "Chrome", "124.0.6367.207"],
+    syncFullHistory: false,
+    generateHighQualityLinkPreview: false,
+    markOnlineOnConnect: true,
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000
+  });
+
+  activeSockets.set(cleanNumber, sock);
+  sock.ev.on("creds.update", saveCreds);
+
+  // Attach command handler (.play, .vv, .menu, etc.)
+  setupMessageHandlers(sock);
+
+  // CRITICAL: Connection state handler with automatic reconnection
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect } = update;
+
+    if (connection === "close") {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+      const shouldReconnect = !isLoggedOut;
+
+      console.log(`Connection closed for ${cleanNumber} (Status: ${statusCode}). Reconnecting: ${shouldReconnect}`);
+
+      if (shouldReconnect) {
+        // Automatically reconnect so the socket stays listening while the user types the code!
+        setTimeout(() => {
+          startSession(cleanNumber, null).catch(console.error);
+        }, 2000);
+      } else {
+        activeSockets.delete(cleanNumber);
+        try {
+          fs.rmSync(sessionDir, { recursive: true, force: true });
+        } catch (_) {}
+      }
+    } else if (connection === "open") {
+      console.log(`✅ TEEBOT 01 successfully linked to ${cleanNumber}!`);
+
+      // Send Welcome Message + Commands upon linking
+      try {
+        const userJid = sock.user.id.split(":")[0] + "@s.whatsapp.net";
+
+        // 1. Logo + Welcome Card
+        await sock.sendMessage(userJid, {
+          image: { url: BOT_LOGO_URL },
+          caption:
+            `╔══════════════════════╗\n` +
+            `   🤖 *WELCOME TO TEEBOT 01* 🤖\n` +
+            `╚══════════════════════╝\n\n` +
+            `✨ WhatsApp successfully linked!\n` +
+            `⚡ *${TOTAL_COMMANDS}+ active commands* loaded.\n` +
+            `🎵 Music Player active (*${PREFIX}play <song name>*)\n` +
+            `🔓 Anti-View-Once active (*${PREFIX}vv*)\n\n` +
+            `Type *${PREFIX}menu* to see all commands anytime.`
+        });
+
+        // 2. Full Command Catalog
+        await sock.sendMessage(userJid, {
+          text: formatCommandCatalog(PREFIX)
+        });
+      } catch (err) {
+        console.error("Failed to send welcome message:", err);
+      }
+    }
+  });
+
+  // Request the 8-character pairing code if this is a new link request
+  if (res) {
+    setTimeout(async () => {
+      try {
+        if (!sock.authState.creds.registered) {
+          const code = await sock.requestPairingCode(cleanNumber);
+          if (!res.headersSent) {
+            return res.json({
+              ok: true,
+              code,
+              number: cleanNumber,
+              message: "Pairing code generated successfully"
+            });
+          }
+        } else {
+          if (!res.headersSent) {
+            return res.json({
+              ok: true,
+              message: "Device is already linked!"
+            });
+          }
+        }
+      } catch (err) {
+        console.error(`Pairing code error for ${cleanNumber}:`, err);
+        if (!res.headersSent) {
+          return res.status(500).json({
+            error: "Failed to generate pairing code",
+            details: err.message
+          });
+        }
+      }
+    }, 3000);
+  }
+}
 
 // Pairing code endpoint called by your Lovable website
 app.get(["/code", "/pair"], async (req, res) => {
@@ -43,108 +196,13 @@ app.get(["/code", "/pair"], async (req, res) => {
     return res.status(400).json({ error: "Phone number must be between 8 and 15 digits" });
   }
 
-  const sessionDir = path.join("/tmp", `teebot_auth_${cleanNumber}`);
-
-  // If an old unlinked session exists, close the previous socket and clean the folder
-  if (activeSockets.has(cleanNumber)) {
-    try {
-      activeSockets.get(cleanNumber).end(undefined);
-    } catch (_) {}
-    activeSockets.delete(cleanNumber);
-  }
-
   try {
-    // Fresh session directory for pairing
-    if (fs.existsSync(sessionDir)) {
-      try {
-        const credsPath = path.join(sessionDir, "creds.json");
-        const isLinked = fs.existsSync(credsPath) && JSON.parse(fs.readFileSync(credsPath, "utf-8"))?.registered;
-        if (!isLinked) {
-          fs.rmSync(sessionDir, { recursive: true, force: true });
-        }
-      } catch (_) {
-        fs.rmSync(sessionDir, { recursive: true, force: true });
-      }
-    }
-
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const { version } = await fetchLatestBaileysVersion();
-
-    const sock = makeWASocket({
-      version,
-      auth: state,
-      logger: pino({ level: "silent" }),
-      printQRInTerminal: false,
-      browser: ["Ubuntu", "Chrome", "20.0.04"],
-      // CRITICAL: Disable full chat sync so login is instant (<3 seconds) and doesn't freeze RAM
-      syncFullHistory: false,
-      generateHighQualityLinkPreview: false,
-      markOnlineOnConnect: true,
-      connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 60000
-    });
-
-    activeSockets.set(cleanNumber, sock);
-    sock.ev.on("creds.update", saveCreds);
-
-    // Setup listener for incoming commands (.play, .vv, .menu, etc.)
-    setupMessageHandlers(sock);
-
-    // Setup connection state listener
-    sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect } = update;
-
-      if (connection === "close") {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`Connection closed (${statusCode}), reconnecting: ${shouldReconnect}`);
-      } else if (connection === "open") {
-        console.log(`✅ TEEBOT 01 successfully linked to ${cleanNumber}!`);
-
-        // Send Welcome Message + Commands to linked user
-        try {
-          const userJid = sock.user.id.split(":")[0] + "@s.whatsapp.net";
-
-          // 1. Send Logo + Welcome Card
-          await sock.sendMessage(userJid, {
-            image: { url: BOT_LOGO_URL },
-            caption:
-              `╔══════════════════════╗\n` +
-              `   🤖 *WELCOME TO TEEBOT 01* 🤖\n` +
-              `╚══════════════════════╝\n\n` +
-              `✨ WhatsApp successfully linked!\n` +
-              `⚡ *${TOTAL_COMMANDS}+ active commands* loaded.\n` +
-              `🎵 Music Player active (*.play <song name>*)\n` +
-              `🔓 Anti-View-Once active (*.vv*)\n\n` +
-              `Type *${PREFIX}menu* to see all commands anytime.`
-          });
-
-          // 2. Send Full Command Catalog text
-          await sock.sendMessage(userJid, {
-            text: formatCommandCatalog(PREFIX)
-          });
-        } catch (err) {
-          console.error("Failed to send welcome message:", err);
-        }
-      }
-    });
-
-    // Wait 2.5 seconds for socket initialization, then request pairing code
-    await new Promise((resolve) => setTimeout(resolve, 2500));
-    const code = await sock.requestPairingCode(cleanNumber);
-
-    return res.json({
-      ok: true,
-      code,
-      number: cleanNumber,
-      message: "Pairing code generated successfully"
-    });
+    await startSession(cleanNumber, res);
   } catch (err) {
-    console.error("Error generating pairing code:", err);
-    return res.status(500).json({
-      error: "Failed to generate pairing code",
-      details: err.message
-    });
+    console.error("Route error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Failed to start pairing session", details: err.message });
+    }
   }
 });
 
@@ -157,25 +215,23 @@ function setupMessageHandlers(sock) {
       if (!msg.message) continue;
 
       const chatId = msg.key.remoteJid;
-      const text =
+      const body =
         msg.message.conversation ||
         msg.message.extendedTextMessage?.text ||
         msg.message.imageMessage?.caption ||
         msg.message.videoMessage?.caption ||
         "";
 
-      const trimmed = text.trim();
-      const parts = trimmed.split(/\s+/);
-      const command = parts[0].toLowerCase();
-      const query = parts.slice(1).join(" ");
+      const trimmed = body.trim();
+      const command = trimmed.split(" ")[0].toLowerCase();
+      const args = trimmed.split(" ").slice(1);
 
-      // ==========================================
-      // 1. MUSIC PLAYER WITH THUMBNAIL (.play / .song / .mp3)
-      // ==========================================
-      if ([".play", "!play", ".song", "!song", ".mp3"].includes(command)) {
+      // 1. MUSIC PLAYER (.play / .song)
+      if ([".play", "!play", ".song", "!song"].includes(command)) {
+        const query = args.join(" ");
         if (!query) {
           await sock.sendMessage(chatId, {
-            text: "🎵 *Please enter a song name!*\n\n*Example:* `.play Burna Boy City Boys`"
+            text: `⚠️ *Usage:* \`${PREFIX}play <song name>\`\n*Example:* \`${PREFIX}play Calm Down Rema\``
           }, { quoted: msg });
           continue;
         }
@@ -191,7 +247,7 @@ function setupMessageHandlers(sock) {
             continue;
           }
 
-          // Send thumbnail card first
+          // Send song info card with thumbnail
           await sock.sendMessage(chatId, {
             image: { url: video.thumbnail },
             caption:
@@ -203,7 +259,6 @@ function setupMessageHandlers(sock) {
               `⏳ *Sending audio file now...*`
           }, { quoted: msg });
 
-          // Download MP3 audio stream
           const dlApi = `https://api.siputzx.my.id/api/d/ytmp3?url=${encodeURIComponent(video.url)}`;
           const dlRes = await fetch(dlApi);
           const dlJson = await dlRes.json();
@@ -239,9 +294,7 @@ function setupMessageHandlers(sock) {
         }
       }
 
-      // ==========================================
       // 2. REVEAL VIEW-ONCE (.vv / .rvo / .reveal)
-      // ==========================================
       if ([".vv", "!vv", ".rvo", ".reveal", ".antiviewonce"].includes(command)) {
         try {
           const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
@@ -305,9 +358,7 @@ function setupMessageHandlers(sock) {
         }
       }
 
-      // ==========================================
       // 3. FULL MENU (.menu / .help)
-      // ==========================================
       if ([".menu", "!menu", ".help", "!help"].includes(command)) {
         await sock.sendMessage(chatId, {
           image: { url: BOT_LOGO_URL },
@@ -315,9 +366,7 @@ function setupMessageHandlers(sock) {
         }, { quoted: msg });
       }
 
-      // ==========================================
       // 4. PING (.ping / .alive)
-      // ==========================================
       if ([".ping", "!ping", ".alive"].includes(command)) {
         await sock.sendMessage(chatId, {
           text: `⚡ *TEEBOT 01 is Online*\n🤖 Total Commands: ${TOTAL_COMMANDS}\n⏱️ Uptime: ${Math.floor(process.uptime())}s`
@@ -330,4 +379,4 @@ function setupMessageHandlers(sock) {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`TEEBOT 01 listening on port ${PORT}`);
 });
-      
+            
