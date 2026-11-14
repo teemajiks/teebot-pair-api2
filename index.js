@@ -7,6 +7,7 @@ import {
   downloadMediaMessage
 } from "@whiskeysockets/baileys";
 import pino from "pino";
+import fs from "fs";
 import path from "path";
 import yts from "yt-search";
 import { formatCommandCatalog, TOTAL_COMMANDS } from "./commands.js";
@@ -17,6 +18,9 @@ const PREFIX = ".";
 
 // Hot-pink TEEBOT 01 logo from your web app
 const BOT_LOGO_URL = process.env.BOT_LOGO_URL || "https://teebot2.lovable.app/icons/icon-512.png";
+
+// Store active sockets in memory
+const activeSockets = new Map();
 
 app.get("/", (req, res) => {
   res.json({
@@ -41,7 +45,28 @@ app.get(["/code", "/pair"], async (req, res) => {
 
   const sessionDir = path.join("/tmp", `teebot_auth_${cleanNumber}`);
 
+  // If an old unlinked session exists, close the previous socket and clean the folder
+  if (activeSockets.has(cleanNumber)) {
+    try {
+      activeSockets.get(cleanNumber).end(undefined);
+    } catch (_) {}
+    activeSockets.delete(cleanNumber);
+  }
+
   try {
+    // Fresh session directory for pairing
+    if (fs.existsSync(sessionDir)) {
+      try {
+        const credsPath = path.join(sessionDir, "creds.json");
+        const isLinked = fs.existsSync(credsPath) && JSON.parse(fs.readFileSync(credsPath, "utf-8"))?.registered;
+        if (!isLinked) {
+          fs.rmSync(sessionDir, { recursive: true, force: true });
+        }
+      } catch (_) {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+      }
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -50,9 +75,16 @@ app.get(["/code", "/pair"], async (req, res) => {
       auth: state,
       logger: pino({ level: "silent" }),
       printQRInTerminal: false,
-      browser: ["Ubuntu", "Chrome", "20.0.04"]
+      browser: ["Ubuntu", "Chrome", "20.0.04"],
+      // CRITICAL: Disable full chat sync so login is instant (<3 seconds) and doesn't freeze RAM
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: false,
+      markOnlineOnConnect: true,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000
     });
 
+    activeSockets.set(cleanNumber, sock);
     sock.ev.on("creds.update", saveCreds);
 
     // Setup listener for incoming commands (.play, .vv, .menu, etc.)
@@ -67,7 +99,7 @@ app.get(["/code", "/pair"], async (req, res) => {
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         console.log(`Connection closed (${statusCode}), reconnecting: ${shouldReconnect}`);
       } else if (connection === "open") {
-        console.log(`✅ TEEBOT 01 linked to ${cleanNumber}!`);
+        console.log(`✅ TEEBOT 01 successfully linked to ${cleanNumber}!`);
 
         // Send Welcome Message + Commands to linked user
         try {
@@ -97,8 +129,8 @@ app.get(["/code", "/pair"], async (req, res) => {
       }
     });
 
-    // Wait 2 seconds for socket initialization, then request pairing code
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    // Wait 2.5 seconds for socket initialization, then request pairing code
+    await new Promise((resolve) => setTimeout(resolve, 2500));
     const code = await sock.requestPairingCode(cleanNumber);
 
     return res.json({
@@ -149,7 +181,6 @@ function setupMessageHandlers(sock) {
         }
 
         try {
-          // 1. Search YouTube for the song
           const search = await yts(query);
           const video = search.videos[0];
 
@@ -160,7 +191,7 @@ function setupMessageHandlers(sock) {
             continue;
           }
 
-          // 2. Send the Thumbnail Preview Card first
+          // Send thumbnail card first
           await sock.sendMessage(chatId, {
             image: { url: video.thumbnail },
             caption:
@@ -172,14 +203,13 @@ function setupMessageHandlers(sock) {
               `⏳ *Sending audio file now...*`
           }, { quoted: msg });
 
-          // 3. Download MP3 stream from free audio endpoint
+          // Download MP3 audio stream
           const dlApi = `https://api.siputzx.my.id/api/d/ytmp3?url=${encodeURIComponent(video.url)}`;
           const dlRes = await fetch(dlApi);
           const dlJson = await dlRes.json();
           const audioUrl = dlJson.data?.dl || dlJson.result?.download || dlJson.download;
 
           if (audioUrl) {
-            // 4. Send audio with thumbnail preview in WhatsApp audio bubble
             await sock.sendMessage(chatId, {
               audio: { url: audioUrl },
               mimetype: "audio/mp4",
@@ -198,7 +228,7 @@ function setupMessageHandlers(sock) {
             }, { quoted: msg });
           } else {
             await sock.sendMessage(chatId, {
-              text: `⚠️ *Audio server busy.* Stream directly here:\n🔗 ${video.url}`
+              text: `⚠️ *Audio stream busy.* Listen directly:\n🔗 ${video.url}`
             }, { quoted: msg });
           }
         } catch (err) {
@@ -300,4 +330,4 @@ function setupMessageHandlers(sock) {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`TEEBOT 01 listening on port ${PORT}`);
 });
-        
+      
